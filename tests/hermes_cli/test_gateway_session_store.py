@@ -5,8 +5,8 @@ from contextlib import asynccontextmanager
 
 import pytest
 
-from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
-from hermes_cli.gateway_connection import GatewayConnection
+from hermes_cli.gateway_client import AnswerLost, GatewayClientError, GatewayRPCError
+from hermes_cli.gateway_connection import DISCONNECTED, NOT_SENT, GatewayConnection
 from hermes_cli.gateway_session_store import GatewaySessionStore
 
 INFO = {"model": "fake-model", "cwd": "/w", "context_length": 128000, "enabled_toolsets": ["file"],
@@ -418,6 +418,220 @@ def test_create_if_missing_titles_a_gateway_created_session(store, monkeypatch):
     assert gss.create_titled_session("Fresh Named") == "local-new"
     _method, params = [c for c in client.calls if c[0] == "session.create"][-1]
     assert params["title"] == "Fresh Named" and params["source"] and params["cwd"]
+
+
+def _failing_creates(client, *errors):
+    """Each ``session.create`` raises the next of ``errors`` (what the transport raised), then answers."""
+    original, pending = client.rpc, list(errors)
+
+    async def rpc(method, *, _timeout=None, **params):
+        if method == "session.create" and pending:
+            client.calls.append((method, params))
+            raise pending.pop(0)
+        return await original(method, _timeout=_timeout, **params)
+    client.rpc = rpc
+
+
+def _creates(client):
+    return [params for method, params in client.calls if method == "session.create"]
+
+
+@pytest.mark.parametrize("lost", [TimeoutError(), AnswerLost(DISCONNECTED)], ids=["deadline", "hang_up"])
+def test_a_lost_create_answer_is_asked_again_under_the_same_request_id(store, lost):
+    """The owner keys a local session by its ``request_id`` and answers a repeat with that session. A
+    fresh id on the retry builds a second agent and orphans the first session (#146359)."""
+    db, client = store
+    _failing_creates(client, lost)
+    assert db.create({}) == "local-new"
+    first, second = _creates(client)
+    assert first == second  # same request_id and the same frozen request, or the owner refuses it
+
+
+@pytest.mark.parametrize("refusal", [GatewayRPCError("invalid_params"), GatewayClientError(NOT_SENT),
+                                     GatewayClientError("Gateway connection failed; no local fallback")],
+                         ids=["owner_refused", "never_sent", "dial_failed"])
+def test_a_refused_or_unsent_create_is_not_asked_again(store, refusal):
+    """A refusal is the owner's answer, and a request that never left has nothing to recover."""
+    db, client = store
+    _failing_creates(client, refusal)
+    with pytest.raises(GatewayClientError) as raised:
+        db.create({})
+    assert raised.value is refusal and len(_creates(client)) == 1
+
+
+def test_the_next_create_after_two_lost_answers_reuses_their_request_id(store):
+    """Both asks lost: the owner may still have created the session. The user's next prompt creates
+    again (``_init_agent``) and must land on it rather than orphan it; a different request does not."""
+    db, client = store
+    _failing_creates(client, TimeoutError(), TimeoutError())
+    with pytest.raises(AnswerLost):
+        db.create({})
+    assert db.create({}) == "local-new"
+    db.create({"model": "other"})
+    db.create({})  # answered above: a new create of the same request is a new session
+    ids = [params["request_id"] for params in _creates(client)]
+    assert ids[0] == ids[1] == ids[2] != ids[3] and ids[4] not in ids[:4]
+
+
+@pytest.mark.parametrize("retry_failure", [GatewayClientError(NOT_SENT),
+                                           GatewayClientError("Gateway connection failed; no local fallback")],
+                         ids=["never_sent", "dial_failed"])
+def test_a_lost_answer_whose_retry_never_left_still_holds_the_request_id(store, retry_failure):
+    """The first ask may have created the session even though the retry's redial failed: the next
+    create must still ask under the same id."""
+    db, client = store
+    _failing_creates(client, TimeoutError(), retry_failure)
+    with pytest.raises(GatewayClientError) as raised:
+        db.create({})
+    assert raised.value is retry_failure  # the user sees what actually failed
+    assert db.create({}) == "local-new"
+    first, second, third = (params["request_id"] for params in _creates(client))
+    assert first == second == third
+
+
+def test_a_refused_retry_after_a_lost_ask_keeps_the_request_id(store):
+    """A draining owner refuses the retry before it looks the session up, though the first ask may
+    have committed it: the next create still asks under that id."""
+    db, client = store
+    _failing_creates(client, TimeoutError(), GatewayRPCError("runtime_draining"))
+    with pytest.raises(GatewayRPCError):
+        db.create({})
+    db.create({})
+    first, second, third = (params["request_id"] for params in _creates(client))
+    assert first == second == third
+
+
+@pytest.mark.parametrize("later", [GatewayRPCError("runtime_draining"), GatewayClientError(NOT_SENT)],
+                         ids=["refused", "never_sent"])
+def test_only_an_answer_settles_a_held_request_id(store, later):
+    """Held after two lost answers: a later ask under it that is refused or never sent says nothing
+    about the first session, so the id stays held until an ask under it is answered."""
+    db, client = store
+    _failing_creates(client, TimeoutError(), TimeoutError(), later)
+    with pytest.raises(AnswerLost):
+        db.create({})
+    with pytest.raises(GatewayClientError):
+        db.create({})
+    db.create({})  # answered: the session the lost asks may have created
+    db.create({})  # a new create after that is a new session
+    ids = [params["request_id"] for params in _creates(client)]
+    assert ids[0] == ids[1] == ids[2] == ids[3] != ids[4]
+
+
+_ID_MISMATCH = GatewayRPCError("invalid_params", data={"field": "request_id"})
+
+
+@pytest.mark.parametrize("verdict", [_ID_MISMATCH, GatewayRPCError("admission_conflict"),
+                                     GatewayRPCError("not_found")],
+                         ids=["another_request", "another_key", "deleted"])
+def test_the_owners_verdict_on_a_held_request_id_releases_it(store, verdict):
+    """The owner looked the id up and refused it (another frozen request, another launch key):
+    every ask under it would be refused the same way, so the next create mints a new one."""
+    db, client = store
+    _failing_creates(client, TimeoutError(), TimeoutError(), verdict)
+    with pytest.raises(AnswerLost):
+        db.create({})
+    with pytest.raises(GatewayRPCError):
+        db.create({})
+    db.create({})
+    ids = [params["request_id"] for params in _creates(client)]
+    assert ids[0] == ids[1] == ids[2] != ids[3]
+
+
+def test_a_refusal_before_the_lookup_keeps_a_held_request_id(store):
+    """``invalid_params`` for a cwd that is gone for now is refused before the owner looks the id up:
+    once the folder is back, the next create still lands on the session the lost asks made."""
+    db, client = store
+    _failing_creates(client, TimeoutError(), TimeoutError(),
+                     GatewayRPCError("invalid_params", data={"field": "cwd"}))
+    with pytest.raises(AnswerLost):
+        db.create({})
+    with pytest.raises(GatewayRPCError):
+        db.create({})
+    db.create({})
+    ids = [params["request_id"] for params in _creates(client)]
+    assert ids[0] == ids[1] == ids[2] == ids[3]
+
+
+def test_a_verdict_on_the_retry_after_a_lost_ask_holds_nothing(store):
+    db, client = store
+    _failing_creates(client, TimeoutError(), _ID_MISMATCH)
+    with pytest.raises(GatewayRPCError):
+        db.create({})
+    db.create({})
+    first, second, third = (params["request_id"] for params in _creates(client))
+    assert first == second != third
+
+
+def test_a_storage_failure_of_a_fresh_create_holds_its_id(store):
+    """``storage_unavailable`` can follow the commit (the snapshot after it failed): not retried at
+    once, but the next create asks under the same id."""
+    db, client = store
+    _failing_creates(client, GatewayRPCError("storage_unavailable"))
+    with pytest.raises(GatewayRPCError):
+        db.create({})
+    db.create({})
+    first, second = (params["request_id"] for params in _creates(client))
+    assert first == second
+
+
+def test_resuming_a_session_settles_a_held_create(store):
+    """Lost creates, then the user resumes a session: a later /new is a new session, never the one the
+    lost asks made (which may be the very session resumed)."""
+    db, client = store
+    _failing_creates(client, TimeoutError(), TimeoutError())
+    with pytest.raises(AnswerLost):
+        db.create({})
+    db.attach("local-old")
+    db.create({})
+    ids = [params["request_id"] for params in _creates(client)]
+    assert ids[0] == ids[1] != ids[2]
+
+
+@pytest.mark.parametrize("failure", [GatewayRPCError("request_failed"), GatewayRPCError("invalid_params")],
+                         ids=["internal_error", "refused"])
+def test_a_failed_fresh_create_holds_its_id(store, failure):
+    """An internal error can follow the owner's commit (``-32603`` from a failure after it), and a
+    refusal costs nothing to ask again under the same id: the next create reuses it."""
+    db, client = store
+    _failing_creates(client, failure)
+    with pytest.raises(GatewayRPCError):
+        db.create({})
+    db.create({})
+    first, second = (params["request_id"] for params in _creates(client))
+    assert first == second
+
+
+def test_an_interrupt_during_the_first_ask_keeps_the_request_id(store):
+    """Ctrl+C while the first ask waits: it is not retried, but the owner may still be building."""
+    db, client = store
+    _failing_creates(client, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        db.create({})
+    db.create({})
+    first, second = (params["request_id"] for params in _creates(client))
+    assert first == second
+
+
+def test_an_interrupt_during_the_retry_keeps_the_request_id(store):
+    """Ctrl+C while the retry waits: the first ask may still have created the session."""
+    db, client = store
+    _failing_creates(client, TimeoutError(), KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        db.create({})
+    db.create({})
+    first, second, third = (params["request_id"] for params in _creates(client))
+    assert first == second == third
+
+
+def test_create_if_missing_asks_a_lost_answer_again_under_the_same_request_id(store, monkeypatch):
+    db, client = store
+    from hermes_cli import gateway_session_store as gss
+    monkeypatch.setattr(gss, "session_store", lambda: db)
+    _failing_creates(client, TimeoutError())
+    assert gss.create_titled_session("Fresh Named") == "local-new"
+    first, second = _creates(client)
+    assert first == second and first["title"] == "Fresh Named"
 
 
 def test_bare_continue_finds_the_last_session_the_cli_created(tmp_path, monkeypatch):

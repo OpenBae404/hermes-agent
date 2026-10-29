@@ -65,6 +65,59 @@ def test_a_human_lease_keeps_the_screen_until_nothing_has_used_it_for_four_windo
     assert runtime.stop_if_idle() is True and stops == [True], "abandoned: no use for four windows"
 
 
+@pytest.mark.parametrize("meanwhile", ["nothing", "another viewer takes over", "the same viewer hands back and retakes",
+                                       "the stop is refused"])
+def test_the_idle_stop_hands_back_only_the_abandoned_human_lease(tmp_path, monkeypatch, meanwhile):
+    """The lapse stops the screen, but a lease that still names the human fences the agent out of the next
+    one ("a human has control"), so the next use never brings the screen back. Only the generation judged
+    abandoned is released: a takeover made while the screen was being stopped is kept."""
+    lease._reset_for_tests()
+    sd, _ = _running(monkeypatch, tmp_path)
+    path = lease._path(None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    same_viewer = meanwhile == "the same viewer hands back and retakes"
+    # Abandoned; the null viewer id (a corrupt or hand-edited lease) must not make the hand-back a bare release.
+    path.write_text('{"holder": "human", "viewer_id": "v1", "epoch": 7}' if same_viewer else
+                    '{"holder": "human", "epoch": 7}', encoding="utf-8")
+    (sd / "activity").touch()
+    _age(sd / "activity", 600 * runtime.HUMAN_LEASE_ABANDONED_WINDOWS + 60)
+
+    def stop(still_due=None):
+        if meanwhile == "the stop is refused":
+            return False
+        assert still_due()  # the real stop() re-judges under start.lock before it kills anything
+        if meanwhile == "another viewer takes over":
+            lease.acquire("v2")
+        elif same_viewer:
+            lease.release("v1")
+            lease.acquire("v1")
+        return True
+
+    monkeypatch.setattr(runtime, "stop", stop)
+    assert runtime.stop_if_idle() is (meanwhile != "the stop is refused")
+    held = lease.get()
+    if meanwhile == "the stop is refused":
+        assert (held.holder, held.epoch) == (lease.HUMAN, 7), "a screen still running keeps its lease"
+    elif meanwhile == "nothing":
+        assert (held.holder, held.viewer_id) == (lease.AGENT, None)
+    else:
+        assert (held.holder, held.viewer_id) == (lease.HUMAN, "v1" if same_viewer else "v2"), \
+            "a takeover made meanwhile was revoked"
+
+
+def test_a_lease_that_cannot_be_written_never_undoes_the_stop(tmp_path, monkeypatch):
+    sd, stops = _running(monkeypatch, tmp_path)
+    monkeypatch.setattr(lease, "get", lambda profile_key=None: lease.Lease(holder=lease.HUMAN, viewer_id="v1"))
+
+    def full_disk(*_, **__):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(lease, "release", full_disk)
+    (sd / "activity").touch()
+    _age(sd / "activity", 600 * runtime.HUMAN_LEASE_ABANDONED_WINDOWS + 60)
+    assert runtime.stop_if_idle() is True and stops == [True]
+
+
 def test_a_short_window_never_times_out_a_human_between_two_viewer_stamps(tmp_path, monkeypatch):
     """An attached viewer stamps activity at most once a minute (and the panel clock repaints once a
     minute), so stamps can be about two minutes apart. With idle_stop_minutes: 0.1 four windows are
